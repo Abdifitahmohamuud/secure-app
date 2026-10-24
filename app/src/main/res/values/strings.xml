@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">SomSecuri</string>
+    <string name="device_admin_label">SomSecuri Security Admin</string>
+    <string name="device_admin_description">Allows local detection of failed device unlock attempts for security monitoring.</string>
+</resources>
