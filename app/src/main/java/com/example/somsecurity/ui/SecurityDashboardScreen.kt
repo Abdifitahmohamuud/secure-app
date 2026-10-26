@@ -61,7 +61,7 @@ fun SecurityDashboardScreen(
     val countdown by viewModel.recordingCountdown.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
 
-    var showCameraPreview by remember { mutableStateOf(false) }
+    var showCameraPreview by remember { mutableStateOf(true) }
     var previewViewInstance by remember { mutableStateOf<PreviewView?>(null) }
     var previewError by remember { mutableStateOf<String?>(null) }
     var viewingPhotoPath by remember { mutableStateOf<String?>(null) }
@@ -91,6 +91,28 @@ fun SecurityDashboardScreen(
                     previewError = err
                 }
             }
+        }
+    }
+
+    val playVideo: (String) -> Unit = { path ->
+        try {
+            val file = File(path)
+            if (file.exists()) {
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file
+                )
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "video/mp4")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(intent)
+            } else {
+                viewModel.setStatusMessage("Video file not found")
+            }
+        } catch (e: Exception) {
+            viewModel.setStatusMessage("Error playing video: ${e.message}")
         }
     }
 
@@ -543,7 +565,8 @@ fun SecurityDashboardScreen(
                     SecurityEventItem(
                         event = event,
                         onDelete = { viewModel.deleteEvent(event) },
-                        onPhotoClick = { path -> viewingPhotoPath = path }
+                        onPhotoClick = { path -> viewingPhotoPath = path },
+                        onVideoClick = { path -> playVideo(path) }
                     )
                 }
             }
@@ -601,7 +624,8 @@ fun SecurityDashboardScreen(
 fun SecurityEventItem(
     event: SecurityEventEntity,
     onDelete: () -> Unit,
-    onPhotoClick: (String) -> Unit
+    onPhotoClick: (String) -> Unit,
+    onVideoClick: (String) -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
     val timeFormatted = remember(event.timestamp) { dateFormat.format(Date(event.timestamp)) }
@@ -742,11 +766,44 @@ fun SecurityEventItem(
                         }
                     } else if (event.mediaType == "VIDEO") {
                         val file = File(path)
-                        Text(
-                            text = "Video saved: ${file.name} (${if (file.exists()) "${file.length() / 1024} KB" else "Deleted"})",
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
+                        if (file.exists()) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clickable { onVideoClick(path) }
+                                    .padding(vertical = 4.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(Color(0xFF2E7D32).copy(alpha = 0.15f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayArrow,
+                                        contentDescription = "Play video",
+                                        tint = Color(0xFF2E7D32),
+                                        modifier = Modifier.size(28.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = file.name,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = "Tap to play video (${file.length() / 1024} KB)",
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        } else {
+                            Text("Video file removed", fontSize = 11.sp, color = Color.Gray)
+                        }
                     }
                 }
             }

@@ -12,6 +12,7 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
@@ -38,6 +39,11 @@ class CameraCaptureManager(
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var cameraSelector: CameraSelector? = null
+    private var currentLifecycleOwner: LifecycleOwner? = null
+    private var currentPreview: Preview? = null
+
     private var imageCapture: ImageCapture? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
@@ -57,11 +63,10 @@ class CameraCaptureManager(
     private fun hasAvailableStorage(requiredBytes: Long): Boolean {
         return try {
             val stat = StatFs(context.filesDir.absolutePath)
-            val available = stat.availableBytes
-            available >= requiredBytes
+            stat.availableBytes >= requiredBytes
         } catch (e: Exception) {
             Log.e(TAG, "Error checking storage capacity", e)
-            true // Allow attempt if stat fails
+            true
         }
     }
 
@@ -89,47 +94,56 @@ class CameraCaptureManager(
             return
         }
 
+        currentLifecycleOwner = lifecycleOwner
+
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             try {
-                val cameraProvider = cameraProviderFuture.get()
-                cameraProvider.unbindAll()
+                val provider = cameraProviderFuture.get()
+                cameraProvider = provider
+                provider.unbindAll()
 
-                // Try front camera first, fallback to back camera
-                val cameraSelector = if (cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
+                val selector = if (provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
                     CameraSelector.DEFAULT_FRONT_CAMERA
-                } else if (cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
+                } else if (provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
                     CameraSelector.DEFAULT_BACK_CAMERA
                 } else {
                     onReady(false, "No compatible camera found on this device")
                     return@addListener
                 }
+                cameraSelector = selector
 
                 imageCapture = ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .build()
 
                 val recorder = Recorder.Builder()
-                    .setQualitySelector(QualitySelector.from(Quality.SD))
+                    .setQualitySelector(
+                        QualitySelector.fromOrderedList(
+                            listOf(Quality.HD, Quality.SD, Quality.LOWEST),
+                            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
+                        )
+                    )
                     .build()
                 videoCapture = VideoCapture.withOutput(recorder)
 
-                val useCases = mutableListOf(imageCapture!!, videoCapture!!)
-
                 if (previewView != null) {
-                    val preview = Preview.Builder().build().also {
+                    currentPreview = Preview.Builder().build().also {
                         it.surfaceProvider = previewView.surfaceProvider
                     }
-                    useCases.add(preview)
                 }
 
-                cameraProvider.bindToLifecycle(
+                // By default, bind Preview and ImageCapture for instant photo readiness
+                val defaultUseCases = mutableListOf<androidx.camera.core.UseCase>(imageCapture!!)
+                currentPreview?.let { defaultUseCases.add(it) }
+
+                provider.bindToLifecycle(
                     lifecycleOwner,
-                    cameraSelector,
-                    *useCases.toTypedArray()
+                    selector,
+                    *defaultUseCases.toTypedArray()
                 )
 
-                Log.i(TAG, "CameraX use cases successfully bound")
+                Log.i(TAG, "CameraX photo/preview mode bound successfully")
                 onReady(true, null)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to bind camera use cases", e)
@@ -142,41 +156,22 @@ class CameraCaptureManager(
         onResult: (success: Boolean, message: String, eventId: Long?) -> Unit
     ) {
         if (!hasCameraPermission()) {
-            recordFailedEvent(
-                eventType = "MANUAL_PHOTO",
-                status = "PERMISSION_DENIED",
-                error = "Camera permission not granted",
-                onResult = onResult
-            )
+            recordFailedEvent("MANUAL_PHOTO", "PERMISSION_DENIED", "Camera permission not granted", onResult)
             return
         }
 
         val capture = imageCapture
         if (capture == null) {
-            recordFailedEvent(
-                eventType = "MANUAL_PHOTO",
-                status = "FAILED",
-                error = "Camera not initialized. Open preview first.",
-                onResult = onResult
-            )
+            recordFailedEvent("MANUAL_PHOTO", "FAILED", "Camera not initialized. Please wait for preview.", onResult)
             return
         }
 
-        // Require at least 20 MB free space
         if (!hasAvailableStorage(20 * 1024 * 1024L)) {
-            recordFailedEvent(
-                eventType = "MANUAL_PHOTO",
-                status = "FAILED",
-                error = "Insufficient internal storage space",
-                onResult = onResult
-            )
+            recordFailedEvent("MANUAL_PHOTO", "FAILED", "Insufficient internal storage space", onResult)
             return
         }
 
-        val photoFile = File(
-            getMediaDirectory("photos"),
-            "photo_${System.currentTimeMillis()}.jpg"
-        )
+        val photoFile = File(getMediaDirectory("photos"), "photo_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
 
         capture.takePicture(
@@ -202,12 +197,7 @@ class CameraCaptureManager(
 
                 override fun onError(exception: ImageCaptureException) {
                     Log.e(TAG, "Photo capture failed", exception)
-                    recordFailedEvent(
-                        eventType = "MANUAL_PHOTO",
-                        status = "FAILED",
-                        error = exception.localizedMessage ?: "Photo capture failed",
-                        onResult = onResult
-                    )
+                    recordFailedEvent("MANUAL_PHOTO", "FAILED", exception.localizedMessage ?: "Photo capture failed", onResult)
                 }
             }
         )
@@ -218,23 +208,7 @@ class CameraCaptureManager(
         onResult: (success: Boolean, message: String, eventId: Long?) -> Unit
     ) {
         if (!hasCameraPermission()) {
-            recordFailedEvent(
-                eventType = "MANUAL_VIDEO",
-                status = "PERMISSION_DENIED",
-                error = "Camera permission not granted",
-                onResult = onResult
-            )
-            return
-        }
-
-        val currentVideoCapture = videoCapture
-        if (currentVideoCapture == null) {
-            recordFailedEvent(
-                eventType = "MANUAL_VIDEO",
-                status = "FAILED",
-                error = "Video capture not initialized. Open preview first.",
-                onResult = onResult
-            )
+            recordFailedEvent("MANUAL_VIDEO", "PERMISSION_DENIED", "Camera permission not granted", onResult)
             return
         }
 
@@ -243,25 +217,57 @@ class CameraCaptureManager(
             return
         }
 
-        // Require at least 50 MB free space for 10-second video
         if (!hasAvailableStorage(50 * 1024 * 1024L)) {
-            recordFailedEvent(
-                eventType = "MANUAL_VIDEO",
-                status = "FAILED",
-                error = "Insufficient internal storage space for video recording",
-                onResult = onResult
-            )
+            recordFailedEvent("MANUAL_VIDEO", "FAILED", "Insufficient storage space for video recording", onResult)
             return
         }
 
-        val videoFile = File(
-            getMediaDirectory("videos"),
-            "video_${System.currentTimeMillis()}.mp4"
-        )
+        val provider = cameraProvider
+        val selector = cameraSelector
+        val lifecycle = currentLifecycleOwner
+
+        if (provider == null || selector == null || lifecycle == null) {
+            recordFailedEvent("MANUAL_VIDEO", "FAILED", "Camera system not ready. Waiting for initialization.", onResult)
+            return
+        }
+
+        // On Limited/Legacy hardware (Samsung Galaxy A14 front camera), binding Preview + ImageCapture + VideoCapture
+        // simultaneously exceeds camera stream limits and causes ERROR_NO_VALID_DATA (error 8).
+        // Solution: Switch to VideoCapture stream exclusively during recording!
+        try {
+            provider.unbindAll()
+            val videoUseCases = mutableListOf<androidx.camera.core.UseCase>(videoCapture!!)
+            currentPreview?.let { videoUseCases.add(it) }
+
+            provider.bindToLifecycle(
+                lifecycle,
+                selector,
+                *videoUseCases.toTypedArray()
+            )
+            Log.i(TAG, "Switched to VideoCapture exclusive stream on camera")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind video stream", e)
+            recordFailedEvent("MANUAL_VIDEO", "FAILED", "Failed to bind video stream: ${e.message}", onResult)
+            return
+        }
+
+        // Brief 250ms pause to ensure Camera HAL finishes surface configuration and activates stream
+        mainHandler.postDelayed({
+            executeRecording(onProgress, onResult)
+        }, 250L)
+    }
+
+    private fun executeRecording(
+        onProgress: (secondsRemaining: Int) -> Unit,
+        onResult: (success: Boolean, message: String, eventId: Long?) -> Unit
+    ) {
+        val currentVideoCapture = videoCapture ?: return
+
+        val videoFile = File(getMediaDirectory("videos"), "video_${System.currentTimeMillis()}.mp4")
         val fileOutputOptions = FileOutputOptions.Builder(videoFile).build()
 
         var pendingRecording = currentVideoCapture.output.prepareRecording(context, fileOutputOptions)
-        if (hasAudioPermission()) {
+        if (hasAudioPermission() && ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             try {
                 pendingRecording = pendingRecording.withAudioEnabled()
             } catch (e: SecurityException) {
@@ -281,33 +287,30 @@ class CameraCaptureManager(
         }
 
         stopTimerRunnable = Runnable {
-            Log.i(TAG, "10-second recording timer expired. Stopping recording...")
+            Log.i(TAG, "10-second timer reached. Stopping video recording...")
             stopRecording()
         }
 
         activeRecording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { recordEvent ->
             when (recordEvent) {
                 is VideoRecordEvent.Start -> {
-                    Log.i(TAG, "10-second video recording started")
+                    Log.i(TAG, "Video recording actively streaming data")
                     mainHandler.post(countdownRunnable)
                     mainHandler.postDelayed(stopTimerRunnable!!, 10000L)
                 }
                 is VideoRecordEvent.Finalize -> {
                     cleanUpRecordingTimer()
                     val error = recordEvent.error
-                    if (recordEvent.hasError() && error != VideoRecordEvent.Finalize.ERROR_NONE) {
+                    val hasError = recordEvent.hasError() && error != VideoRecordEvent.Finalize.ERROR_NONE
+
+                    // Rebind photo use cases for subsequent photo captures
+                    restorePhotoUseCases()
+
+                    if (hasError) {
                         Log.e(TAG, "Video recording finalize error: $error")
-                        // Clean up partial file if error is severe
-                        val isInterrupted = error == VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE ||
-                                error == VideoRecordEvent.Finalize.ERROR_RECORDING_GARBAGE_COLLECTED
-                        val status = if (isInterrupted) "INTERRUPTED" else "FAILED"
-                        val errDesc = "Recording ended with error code $error"
-                        recordFailedEvent(
-                            eventType = "MANUAL_VIDEO",
-                            status = status,
-                            error = errDesc,
-                            onResult = onResult
-                        )
+                        val status = if (error == VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) "INTERRUPTED" else "FAILED"
+                        val errDesc = "Video recording ended with error code $error"
+                        recordFailedEvent("MANUAL_VIDEO", status, errDesc, onResult)
                     } else {
                         Log.i(TAG, "Video recording finalized successfully: ${videoFile.absolutePath}")
                         CoroutineScope(Dispatchers.IO).launch {
@@ -328,6 +331,24 @@ class CameraCaptureManager(
                 }
                 else -> {}
             }
+        }
+    }
+
+    private fun restorePhotoUseCases() {
+        try {
+            val provider = cameraProvider ?: return
+            val selector = cameraSelector ?: return
+            val lifecycle = currentLifecycleOwner ?: return
+            val capture = imageCapture ?: return
+
+            provider.unbindAll()
+            val photoUseCases = mutableListOf<androidx.camera.core.UseCase>(capture)
+            currentPreview?.let { photoUseCases.add(it) }
+
+            provider.bindToLifecycle(lifecycle, selector, *photoUseCases.toTypedArray())
+            Log.i(TAG, "Restored photo/preview stream on camera")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error restoring photo use cases", e)
         }
     }
 
@@ -373,4 +394,3 @@ class CameraCaptureManager(
         private const val TAG = "CameraCaptureManager"
     }
 }
-

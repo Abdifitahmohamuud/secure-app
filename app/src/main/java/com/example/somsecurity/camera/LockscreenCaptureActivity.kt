@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.StatFs
 import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
@@ -15,10 +16,16 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.example.somsecurity.SecurityApp
@@ -27,20 +34,23 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 class LockscreenCaptureActivity : ComponentActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var cameraExecutor: ExecutorService? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var isCapturing = false
+    private var recording: Recording? = null
+    private var captureCompleted = false
     private var attemptsCount = 1
 
     private val timeoutRunnable = Runnable {
-        Log.w(TAG, "Capture timed out after 4 seconds. Closing activity.")
-        finishSafely("FAILED", "Camera capture timed out")
+        Log.w(TAG, "Video capture timed out. Closing activity.")
+        finishSafely("FAILED", "Video capture timed out")
+    }
+
+    private val stopRecordingRunnable = Runnable {
+        Log.i(TAG, "10-second failed-unlock video duration reached")
+        recording?.stop()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -69,7 +79,7 @@ class LockscreenCaptureActivity : ComponentActivity() {
                 PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
                 "somsecurity:capture_lock"
             ).apply {
-                acquire(5000L)
+                acquire(CAPTURE_TIMEOUT_MS)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Could not acquire wake lock", e)
@@ -93,7 +103,7 @@ class LockscreenCaptureActivity : ComponentActivity() {
         rootLayout.addView(previewView)
 
         val statusText = TextView(this).apply {
-            text = "Securing..."
+            text = "Recording security video..."
             setTextColor(Color.WHITE)
             textSize = 14f
             gravity = Gravity.CENTER
@@ -107,15 +117,12 @@ class LockscreenCaptureActivity : ComponentActivity() {
 
         setContentView(rootLayout)
 
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        mainHandler.postDelayed(timeoutRunnable, CAPTURE_TIMEOUT_MS)
 
-        // 4-second safety watchdog
-        mainHandler.postDelayed(timeoutRunnable, 4000L)
-
-        startCapture(previewView)
+        startVideoCapture(previewView)
     }
 
-    private fun startCapture(previewView: PreviewView) {
+    private fun startVideoCapture(previewView: PreviewView) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             try {
@@ -131,25 +138,38 @@ class LockscreenCaptureActivity : ComponentActivity() {
                     return@addListener
                 }
 
+                val mediaDir = File(filesDir, "security_media/videos")
+                if (!mediaDir.exists() && !mediaDir.mkdirs()) {
+                    finishSafely("FAILED", "Could not create video storage directory")
+                    return@addListener
+                }
+                if (StatFs(filesDir.absolutePath).availableBytes < MIN_VIDEO_STORAGE_BYTES) {
+                    finishSafely("FAILED", "Insufficient storage space for video recording")
+                    return@addListener
+                }
+
                 val preview = Preview.Builder().build().also {
                     it.surfaceProvider = previewView.surfaceProvider
                 }
 
-                val imageCapture = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(
+                        QualitySelector.fromOrderedList(
+                            listOf(Quality.HD, Quality.SD, Quality.LOWEST),
+                            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
+                        )
+                    )
                     .build()
+                val videoCapture = VideoCapture.withOutput(recorder)
 
                 cameraProvider.bindToLifecycle(
                     this,
                     cameraSelector,
                     preview,
-                    imageCapture
+                    videoCapture
                 )
 
-                // Brief 350ms delay for auto-exposure convergence
-                mainHandler.postDelayed({
-                    takePhoto(imageCapture)
-                }, 350L)
+                startRecording(videoCapture, mediaDir)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Error binding camera for lockscreen capture", e)
@@ -158,53 +178,69 @@ class LockscreenCaptureActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun takePhoto(imageCapture: ImageCapture) {
-        if (isCapturing) return
-        isCapturing = true
-
-        val mediaDir = File(filesDir, "security_media/photos").apply { mkdirs() }
-        val photoFile = File(mediaDir, "intruder_${System.currentTimeMillis()}.jpg")
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
-
-        imageCapture.takePicture(
-            outputOptions,
-            cameraExecutor ?: ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    Log.i(TAG, "Intruder photo saved successfully: ${photoFile.absolutePath}")
-                    CoroutineScope(Dispatchers.IO).launch {
-                        try {
-                            val db = (application as SecurityApp).database
-                            val event = SecurityEventEntity(
-                                eventType = "FAILED_UNLOCK",
-                                failedAttemptsCount = attemptsCount,
-                                captureStatus = "SUCCESS",
-                                mediaPath = photoFile.absolutePath,
-                                mediaType = "PHOTO",
-                                errorMessage = null
-                            )
-                            val rowId = db.securityEventDao().insertEvent(event)
-                            Log.i(TAG, "Intruder event inserted with rowId: $rowId")
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to insert intruder event to database", e)
-                        } finally {
-                            mainHandler.post {
-                                finishSafely(null, null)
-                            }
+    private fun startRecording(videoCapture: VideoCapture<Recorder>, mediaDir: File) {
+        val videoFile = File(mediaDir, "intruder_${System.currentTimeMillis()}.mp4")
+        recording = videoCapture.output
+            .prepareRecording(this, FileOutputOptions.Builder(videoFile).build())
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        Log.i(TAG, "Failed-unlock video recording started")
+                        mainHandler.postDelayed(stopRecordingRunnable, VIDEO_DURATION_MS)
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        mainHandler.removeCallbacks(stopRecordingRunnable)
+                        recording = null
+                        if (captureCompleted) {
+                            videoFile.delete()
+                            return@start
+                        }
+                        if (event.hasError()) {
+                            Log.e(TAG, "Failed-unlock video recording ended with error ${event.error}")
+                            videoFile.delete()
+                            finishSafely("FAILED", "Video recording failed with error ${event.error}")
+                        } else {
+                            saveVideoEvent(videoFile)
                         }
                     }
                 }
-
-                override fun onError(exception: ImageCaptureException) {
-                    Log.e(TAG, "Intruder photo capture error", exception)
-                    finishSafely("FAILED", exception.localizedMessage ?: "Camera capture error")
-                }
             }
-        )
+    }
+
+    private fun saveVideoEvent(videoFile: File) {
+        if (captureCompleted) return
+        captureCompleted = true
+        mainHandler.removeCallbacks(timeoutRunnable)
+        releaseWakeLock()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val db = (application as SecurityApp).database
+                val event = SecurityEventEntity(
+                    eventType = "FAILED_UNLOCK",
+                    failedAttemptsCount = attemptsCount,
+                    captureStatus = "SUCCESS",
+                    mediaPath = videoFile.absolutePath,
+                    mediaType = "VIDEO",
+                    errorMessage = null
+                )
+                val rowId = db.securityEventDao().insertEvent(event)
+                Log.i(TAG, "Intruder video event inserted with rowId: $rowId")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to insert intruder video event", e)
+            } finally {
+                mainHandler.post { finish() }
+            }
+        }
     }
 
     private fun finishSafely(statusIfFailed: String?, errorMessage: String?) {
+        if (captureCompleted) return
+        captureCompleted = true
         mainHandler.removeCallbacks(timeoutRunnable)
+        mainHandler.removeCallbacks(stopRecordingRunnable)
+        recording?.stop()
+        recording = null
         releaseWakeLock()
 
         if (statusIfFailed != null) {
@@ -221,11 +257,9 @@ class LockscreenCaptureActivity : ComponentActivity() {
                     )
                     db.securityEventDao().insertEvent(event)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error logging failed capture event", e)
+                    Log.e(TAG, "Error logging failed video capture event", e)
                 } finally {
-                    mainHandler.post {
-                        finish()
-                    }
+                    mainHandler.post { finish() }
                 }
             }
         } else {
@@ -247,12 +281,17 @@ class LockscreenCaptureActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         mainHandler.removeCallbacks(timeoutRunnable)
+        mainHandler.removeCallbacks(stopRecordingRunnable)
+        recording?.stop()
+        recording = null
         releaseWakeLock()
-        cameraExecutor?.shutdown()
     }
 
     companion object {
         private const val TAG = "LockscreenCapture"
         const val EXTRA_ATTEMPTS = "extra_attempts_count"
+        private const val VIDEO_DURATION_MS = 10_000L
+        private const val CAPTURE_TIMEOUT_MS = 30_000L
+        private const val MIN_VIDEO_STORAGE_BYTES = 50 * 1024 * 1024L
     }
 }
